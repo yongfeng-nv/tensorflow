@@ -21,6 +21,7 @@ limitations under the License.
 #include "tensorflow/compiler/xla/array4d.h"
 #include "tensorflow/compiler/xla/client/lib/constants.h"
 #include "tensorflow/compiler/xla/client/xla_builder.h"
+#include "tensorflow/compiler/xla/primitive_util.h"
 #include "tensorflow/core/framework/kernel_def_builder.h"
 #include "tensorflow/core/framework/register_types.h"
 #include "tensorflow/core/lib/math/math_util.h"
@@ -455,7 +456,7 @@ xla::XlaOp ResizeUsingDilationAndConvolutionGradOp(
 }
 
 void GeneralCompile(XlaOpKernelContext* ctx, bool align_corners_,
-                    bool is_kernel_bilinear) {
+                    bool is_kernel_bilinear, bool is_gpu_device) {
   xla::XlaBuilder* b = ctx->builder();
 
   TensorShape input_shape = ctx->InputShape(0);
@@ -503,7 +504,12 @@ void GeneralCompile(XlaOpKernelContext* ctx, bool align_corners_,
   }
 
   // Output is always type float if 'is_kernel_bilinear' is true.
-  if (is_kernel_bilinear) {
+  // GPU with integer input also uses float, because XLA
+  // integer convolution on CuDNN is either not supported or not allowed
+  // directly.
+  xla::PrimitiveType original_input_type = input_type;
+  if (is_kernel_bilinear || (is_gpu_device &&
+                             xla::primitive_util::IsIntegralType(input_type))) {
     input = xla::ConvertElementType(input, xla::F32);
     input_type = xla::F32;
   }
@@ -555,13 +561,19 @@ void GeneralCompile(XlaOpKernelContext* ctx, bool align_corners_,
     }
   }
 
+  // Bilinear always outputs float, but nearest neighbor keeps the original type
+  if (!is_kernel_bilinear && original_input_type != input_type) {
+    input = xla::ConvertElementType(input, original_input_type);
+  }
   ctx->SetOutput(0, input);
 }
 
 class ResizeNearestNeighborOp : public XlaOpKernel {
  public:
   explicit ResizeNearestNeighborOp(OpKernelConstruction* ctx)
-      : XlaOpKernel(ctx) {
+      : XlaOpKernel(ctx), is_gpu_device_([](absl::string_view s) {
+          return s == DEVICE_GPU_XLA_JIT || s == DEVICE_XLA_GPU;
+        }(ctx->device_type().type_string())) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("align_corners", &align_corners_));
     OP_REQUIRES(
         ctx, align_corners_ == true,
@@ -576,13 +588,14 @@ class ResizeNearestNeighborOp : public XlaOpKernel {
   }
 
   void Compile(XlaOpKernelContext* ctx) override {
-    GeneralCompile(ctx, align_corners_, is_kernel_bilinear_);
+    GeneralCompile(ctx, align_corners_, is_kernel_bilinear_, is_gpu_device_);
   }
 
  private:
   bool align_corners_ = true;
   bool half_pixel_centers_ = true;
   bool is_kernel_bilinear_ = false;
+  bool is_gpu_device_;
 };
 
 REGISTER_XLA_OP(Name("ResizeNearestNeighbor").CompileTimeConstantInput("size"),
@@ -590,7 +603,10 @@ REGISTER_XLA_OP(Name("ResizeNearestNeighbor").CompileTimeConstantInput("size"),
 
 class ResizeBilinearOp : public XlaOpKernel {
  public:
-  explicit ResizeBilinearOp(OpKernelConstruction* ctx) : XlaOpKernel(ctx) {
+  explicit ResizeBilinearOp(OpKernelConstruction* ctx)
+      : XlaOpKernel(ctx), is_gpu_device_([](absl::string_view s) {
+          return s == DEVICE_GPU_XLA_JIT || s == DEVICE_XLA_GPU;
+        }(ctx->device_type().type_string())) {
     OP_REQUIRES_OK(ctx, ctx->GetAttr("align_corners", &align_corners_));
     OP_REQUIRES_OK(ctx,
                    ctx->GetAttr("half_pixel_centers", &half_pixel_centers_));
@@ -601,13 +617,14 @@ class ResizeBilinearOp : public XlaOpKernel {
   }
 
   void Compile(XlaOpKernelContext* ctx) override {
-    GeneralCompile(ctx, align_corners_, is_kernel_bilinear_);
+    GeneralCompile(ctx, align_corners_, is_kernel_bilinear_, is_gpu_device_);
   }
 
  private:
   bool align_corners_ = true;
   bool half_pixel_centers_ = true;
   bool is_kernel_bilinear_ = true;
+  bool is_gpu_device_;
 };
 
 REGISTER_XLA_OP(Name("ResizeBilinear").CompileTimeConstantInput("size"),
